@@ -1,0 +1,98 @@
+name: Windows portable EXE
+
+on:
+  push:
+    branches:
+      - feat/max-sqlite-archive
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    name: Windows portable archive and smoke test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install and test Python app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
+          python -m pip install -e '.[gui]' 'pyinstaller>=6.16,<7'
+          if ($LASTEXITCODE -ne 0) { throw 'Python install failed' }
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+
+      - name: Freeze Python GUI into Chempi.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Chempi --contents-directory _internal scripts/portable_entry.py
+          if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
+          if (-not (Test-Path 'dist/Chempi/Chempi.exe')) { throw 'No Windows EXE' }
+
+      - name: Include Node.js and MAX CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtime = Join-Path $PWD 'dist/Chempi/runtime'
+          New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+          Copy-Item (Get-Command node.exe).Source (Join-Path $runtime 'node.exe')
+          npm install --prefix $runtime '@wirecat/max-cli@0.118.0' --omit=dev --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'MAX CLI npm install failed' }
+          $entry = Join-Path $runtime 'node_modules/@wirecat/max-cli/dist/bin/max.js'
+          if (-not (Test-Path $entry)) { throw 'MAX CLI entry missing' }
+          & (Join-Path $runtime 'node.exe') $entry --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Embedded MAX CLI failed to start' }
+          Set-Content -Path 'dist/Chempi/portable.flag' -Value 'Portable Chempi archive' -Encoding UTF8
+          Copy-Item 'README.md' 'dist/Chempi/README.md'
+
+      - name: Smoke-test frozen GUI without MAX account
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & '.\dist\Chempi\Chempi.exe' --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Frozen EXE startup test failed: $LASTEXITCODE" }
+
+      - name: Zip portable directory and create SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Compress-Archive -Path 'dist/Chempi' -DestinationPath 'release/Chempi-MAX-Windows-portable.zip' -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Path 'release/Chempi-MAX-Windows-portable.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path 'release/Chempi-MAX-Windows-portable.zip.sha256' -Value "$hash  Chempi-MAX-Windows-portable.zip" -Encoding ASCII
+          Get-Item 'release/Chempi-MAX-Windows-portable.zip' | Format-Table Name,Length
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chempi-MAX-Windows-portable
+          path: |
+            release/Chempi-MAX-Windows-portable.zip
+            release/Chempi-MAX-Windows-portable.zip.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish experimental prerelease
+        shell: pwsh
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'v0.1.0-portable.' + '${{ github.run_number }}'
+          gh release create $tag 'release/Chempi-MAX-Windows-portable.zip' 'release/Chempi-MAX-Windows-portable.zip.sha256' --target '${{ github.sha }}' --prerelease --title "Chempi MAX Windows portable beta ($tag)" --notes 'Bundle contains Chempi.exe, Qt, Node.js and MAX CLI. Extract entire folder; no Python or Node installation required. MAX login and real video-circle downloading still require live verification.'
