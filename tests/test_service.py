@@ -16,6 +16,7 @@ class FakeMax:
     def __init__(self):
         self.step=0
         self.download_calls=0
+        self.cached_messages=set()
     def chats(self):
         return [{'id':'chat-1','title':'Family','kind':'group'}]
     def sync_page(self,chat_id,batch_size=60,progress=None):
@@ -26,10 +27,19 @@ class FakeMax:
     def store_export(self,chat_id,path):
         import json
         path.write_text('\n'.join(json.dumps(r) for r in [message(i) for i in range(1,self.step+1)]),encoding='utf-8')
-    def media_download(self,chat_id,mid,pos,folder):
+    def media_download(self,chat_id,mid,pos,folder,offline=False):
+        folder.mkdir(parents=True,exist_ok=True)
+        if offline:
+            if str(mid) not in self.cached_messages:
+                raise MaxClientError('attachment not saved in local cache')
+            path=folder/f'selected-{pos}.bin'
+            path.write_bytes(b'\x00\x00\x00\x18ftypmp42fake')
+            return {'saved':1,'files':[{'path':str(path)}]}
         self.download_calls+=1
-        (folder/'raw.bin').write_bytes(b'\x00\x00\x00\x18ftypmp42fake')
-        return {'saved':1,'files':[{'path':str(folder/'raw.bin')} ]}
+        self.cached_messages.add(str(mid))
+        path=folder/'all.bin'
+        path.write_bytes(b'\x00\x00\x00\x18ftypmp42fake')
+        return {'saved':1,'files':[{'path':str(path)}]}
 
 
 class ServiceTests(unittest.TestCase):
@@ -59,6 +69,21 @@ class ServiceTests(unittest.TestCase):
         saved=Path(self.tmp.name)/path
         self.assertTrue(saved.exists())
         self.assertEqual(int(saved.stat().st_mtime),1772888460)
+    def test_album_downloads_online_once_and_saves_each_position(self):
+        item = message(7, kind='photo')
+        item['attachments'] = [{'kind':'photo','id':'first'},{'kind':'photo','id':'second'}]
+        self.srv.db.add_messages([item])
+        got = self.srv.download_media('chat-1','photo')
+        self.assertEqual(got['queued'],2)
+        self.assertEqual(got['saved'],2)
+        self.assertEqual(got['failed'],0)
+        self.assertEqual(self.client.download_calls,1)
+        files=list((Path(self.tmp.name)/'media'/'chat-1'/'photo').glob('*'))
+        self.assertEqual(len(files),2)
+        second = self.srv.download_media('chat-1','photo')
+        self.assertEqual(second['queued'],0)
+        self.assertEqual(self.client.download_calls,1)
+
     def test_cli_sync_complete_flag_is_authoritative(self):
         class FullSync(FakeMax):
             def coverage(self,chat_id):
