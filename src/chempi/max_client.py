@@ -10,6 +10,9 @@ import os
 import shutil
 import subprocess
 import sys
+import re
+import threading
+from collections import deque
 
 
 class MaxClientError(RuntimeError):
@@ -58,24 +61,125 @@ class MaxClient:
         self.executable = self.command_prefix[0]
         self.runner = runner or subprocess.run
 
+    @staticmethod
+    def _runtime_environment():
+        env = os.environ.copy()
+        # MAX CLI read/download functions must not send, edit or delete messages.
+        # Setup/login runs separately and is intentionally not subject to this.
+        env['MAX_READ_ONLY'] = '1'
+        env['MAX_NO_UPDATE_CHECK'] = '1'
+        return env
+
+    @staticmethod
+    def _windows_flags():
+        return subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    @staticmethod
+    def _failed_command(returncode, operation):
+        code = returncode & 0xffffffff
+        if code == 0xC000013A:
+            return MaxClientError(
+                'MAX CLI was interrupted by a Windows console-control event '
+                '(0xC000013A). Already fetched pages may be in its local store. '
+                'Restart sync; Chempi will import them without duplicates.'
+            )
+        if returncode == 8:
+            return MaxClientError('MAX rate limit reached. Retry after cooldown.')
+        if returncode == 4:
+            return MaxClientError('MAX authorization required. Sign in again.')
+        return MaxClientError(f'MAX CLI {operation} failed (exit {returncode}). '
+                              'Existing archive data were not deleted.')
+
     def run(self, *arguments, timeout=3600, json_output=True):
-        command = [*self.command_prefix, self.profile, *map(str,arguments)]
+        """Small read-only CLI calls. History sync has its own live-progress path."""
+        command = [*self.command_prefix, self.profile, *map(str, arguments)]
         if json_output:
             command.append('--json')
         try:
             response = self.runner(command, capture_output=True, text=True,
-                                   encoding='utf-8', errors='replace', timeout=timeout, check=False)
+                                   encoding='utf-8', errors='replace', timeout=timeout,
+                                   check=False, env=self._runtime_environment(),
+                                   creationflags=self._windows_flags())
         except subprocess.TimeoutExpired as error:
-            raise MaxClientError(f'Timeout during {arguments[0:2]}') from error
+            raise MaxClientError(f'MAX CLI timeout during {arguments[:2]}') from error
         if response.returncode:
-            # Avoid showing raw traceback / message content in GUI. Tool stdout can
-            # contain private messages; show only a redacted error category.
-            raw = (response.stderr or '')[-1500:]
-            if response.returncode == 8:
-                raise MaxClientError('MAX rate limit reached. Retry after its cooldown.')
-            message = 'authorization required' if response.returncode == 4 else 'command failed'
-            raise MaxClientError(f'{message} (exit {response.returncode}; {arguments[0:2]}). '+raw[:250])
+            raise self._failed_command(response.returncode, ' '.join(map(str, arguments[:2])))
         return extract_payload(response.stdout) if json_output else response.stdout
+
+    def _streaming_sync(self, command, progress, timeout=1800):
+        """Drain stderr as it arrives instead of waiting minutes inside run().
+
+        max-cli emits JSONL progress on stderr and one JSON result on stdout.
+        Only numeric progress is shown; no chat content is ever logged here.
+        """
+        stdout_parts = []
+        stderr_tail = deque(maxlen=8)
+        stdout_oversize = [False]
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding='utf-8',
+                errors='replace', bufsize=1, env=self._runtime_environment(),
+                creationflags=self._windows_flags(),
+            )
+        except OSError as error:
+            raise MaxClientError(f'Cannot start MAX CLI: {type(error).__name__}') from error
+
+        def read_stdout():
+            length = 0
+            for line in process.stdout:
+                length += len(line)
+                if length <= 4_000_000:
+                    stdout_parts.append(line)
+                else:
+                    stdout_oversize[0] = True
+
+        def read_stderr():
+            previous = None
+            for line in process.stderr:
+                value = line.strip()
+                if not value:
+                    continue
+                stderr_tail.append(value[:180])
+                found = None
+                try:
+                    payload = json.loads(value)
+                except (ValueError, TypeError):
+                    payload = None
+                if isinstance(payload, dict) and payload.get('event') == 'progress':
+                    if payload.get('step') == 'sync':
+                        count = payload.get('fetched')
+                        if isinstance(count, int) and count >= 0:
+                            found = f'MAX: {count} messages fetched in current batch'
+                else:
+                    match = re.search(r'(\\d+) messages so far, back to (\\d{4}-\\d{2}-\\d{2})', value)
+                    if match:
+                        found = f'MAX: {match.group(1)} messages; oldest so far {match.group(2)}'
+                if found and found != previous and progress:
+                    previous = found
+                    progress(found)
+
+        out_thread = threading.Thread(target=read_stdout, daemon=True)
+        err_thread = threading.Thread(target=read_stderr, daemon=True)
+        out_thread.start()
+        err_thread.start()
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            raise MaxClientError('MAX sync batch timed out; locally cached messages can be recovered') from error
+        finally:
+            out_thread.join(timeout=5)
+            err_thread.join(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
+        if code != 0:
+            raise self._failed_command(code, 'messages sync')
+        if stdout_oversize[0]:
+            raise MaxClientError('MAX CLI returned unexpectedly large sync result')
+        return extract_payload(''.join(stdout_parts))
 
     def chats(self):
         data = self.run('chats','list','--all')
@@ -96,8 +200,17 @@ class MaxClient:
             raise MaxClientError('MAX did not create export file')
         return path
 
-    def sync_page(self, chat_id: str, batch_size=1200):
-        return self.run('messages','sync',chat_id,'--full-history','--limit',str(batch_size), timeout=1800)
+    def sync_page(self, chat_id: str, batch_size=60, progress=None):
+        """Fetch at most two MAX pages per command, so Stop is responsive.
+
+        Each repeated command resumes history based on the MAX CLI local store.
+        Progress is forwarded immediately from stderr, not after completion.
+        """
+        if not 1 <= batch_size <= 1200:
+            raise ValueError('Invalid MAX sync batch size')
+        command = [*self.command_prefix, self.profile, 'messages', 'sync',
+                   str(chat_id), '--full-history', '--limit', str(batch_size), '--json']
+        return self._streaming_sync(command, progress, timeout=1800)
 
     def coverage(self, chat_id: str):
         return self.run('store','status',chat_id,timeout=90)
