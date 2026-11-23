@@ -9,18 +9,34 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 
 
 class MaxClientError(RuntimeError):
     pass
 
 
-def max_executable() -> str:
-    for item in (('max.cmd','max.exe','max') if os.name == 'nt' else ('max',)):
+def max_command() -> list[str]:
+    """Locate the embedded Node/MAX runtime before checking global installs."""
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent
+        node = root / "runtime" / "node.exe"
+        entry = root / "runtime" / "node_modules" / "@wirecat" / "max-cli" / "dist" / "bin" / "max.js"
+        if node.is_file() and entry.is_file():
+            return [str(node), str(entry)]
+        # An incomplete portable package must not silently execute a different
+        # globally installed client with possibly different behavior.
+        raise MaxClientError("Portable runtime incomplete: node.exe or MAX CLI missing. Re-extract the complete ZIP.")
+    for item in (('max.cmd', 'max.exe', 'max') if os.name == 'nt' else ('max',)):
         path = shutil.which(item)
         if path:
-            return path
+            return [path]
     raise MaxClientError('MAX CLI not found. Install Node.js 22.16+ and run: npm install -g @wirecat/max-cli')
+
+
+def max_executable() -> str:
+    """Legacy helper for callers that need to display the executable path."""
+    return max_command()[0]
 
 
 def extract_payload(raw: str):
@@ -38,11 +54,12 @@ class MaxClient:
         if not profile.replace('-', '').replace('_', '').isalnum():
             raise ValueError('Invalid profile name')
         self.profile = profile
-        self.executable = executable or max_executable()
+        self.command_prefix = [executable] if executable else max_command()
+        self.executable = self.command_prefix[0]
         self.runner = runner or subprocess.run
 
     def run(self, *arguments, timeout=3600, json_output=True):
-        command = [self.executable, self.profile, *map(str,arguments)]
+        command = [*self.command_prefix, self.profile, *map(str,arguments)]
         if json_output:
             command.append('--json')
         try:
@@ -97,15 +114,17 @@ class MaxClient:
 
 def launch_setup_terminal(profile='personal'):
     """Open an interactive terminal for QR setup; don't touch credentials."""
-    command = max_executable()
+    command = [*max_command(), profile, 'setup', '--agent', 'none']
     if os.name == 'nt':
-        # The QR code is displayed by max-cli. Child has a new console.
-        return subprocess.Popen(['cmd.exe','/k',command,profile,'setup','--agent','none'],
+        # A separate visible console displays the QR code; nothing is copied
+        # into the app's log or SQLite. list2cmdline handles paths with spaces.
+        line = subprocess.list2cmdline(command)
+        return subprocess.Popen(['cmd.exe', '/d', '/k', line],
                                 creationflags=subprocess.CREATE_NEW_CONSOLE)
     for terminal in ('x-terminal-emulator', 'gnome-terminal', 'konsole', 'xterm'):
         exe = shutil.which(terminal)
         if exe:
             if terminal == 'gnome-terminal':
-                return subprocess.Popen([exe, '--', command, profile, 'setup', '--agent', 'none'])
-            return subprocess.Popen([exe,'-e',command,profile,'setup','--agent','none'])
-    raise MaxClientError(f'No terminal found. Run manually: {command} {profile} setup --agent none')
+                return subprocess.Popen([exe, '--', *command])
+            return subprocess.Popen([exe, '-e', *command])
+    raise MaxClientError(f'No terminal found. Run manually: {subprocess.list2cmdline(command)}')
