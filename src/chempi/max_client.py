@@ -152,7 +152,7 @@ class MaxClient:
                         if isinstance(count, int) and count >= 0:
                             found = f'MAX: {count} messages fetched in current batch'
                 else:
-                    match = re.search(r'(\\d+) messages so far, back to (\\d{4}-\\d{2}-\\d{2})', value)
+                    match = re.search(r'(\d+) messages so far, back to (\d{4}-\d{2}-\d{2})', value)
                     if match:
                         found = f'MAX: {match.group(1)} messages; oldest so far {match.group(2)}'
                 if found and found != previous and progress:
