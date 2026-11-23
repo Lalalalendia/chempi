@@ -38,6 +38,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Set-Content -Path 'src/chempi/build_info.py' -Value ("BUILD_NUMBER = '" + $env:GITHUB_RUN_NUMBER + "'") -Encoding ASCII
           python -m PyInstaller --noconfirm --clean --windowed --onedir --name Chempi --contents-directory _internal scripts/portable_entry.py
           if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
           if (-not (Test-Path 'dist/Chempi/Chempi.exe')) { throw 'No Windows EXE' }
