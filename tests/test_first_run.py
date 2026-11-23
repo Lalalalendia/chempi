@@ -9,7 +9,9 @@ class EmptyFirstClient:
     def store_export(self, chat, path):
         if not self.step:raise MaxClientError('no messages cached')
         path.write_text('{"id":"1","chat_id":"c","text":"Hi","timestamp":"2026-01-01T00:00:00Z"}\n')
-    def sync_page(self, chat):self.step=1
+    def sync_page(self, chat, batch_size=60, progress=None):
+        self.step=1
+        if progress: progress('MAX: first batch completed')
     def coverage(self, chat):return {'complete': self.step>0}
 
 class FirstRun(unittest.TestCase):
