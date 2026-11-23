@@ -10,7 +10,7 @@ from chempi.cli import default_root
 class PortableTests(unittest.TestCase):
     def test_embedded_runtime_is_selected(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             node = root / "runtime" / "node.exe"
             script = root / "runtime" / "node_modules" / "@wirecat" / "max-cli" / "dist" / "bin" / "max.js"
             script.parent.mkdir(parents=True)
@@ -28,7 +28,7 @@ class PortableTests(unittest.TestCase):
 
     def test_portable_archive_dir(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             (root / "portable.flag").write_text("portable")
             with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(root / "Chempi.exe")):
                 self.assertEqual(default_root(), root / "data")
