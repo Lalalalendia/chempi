@@ -244,6 +244,9 @@ class ArchiveService:
             progress(f'Requeued missing or corrupt files: {count}')
         queue = self.db.media_queue(chat_id,kind,since)[:limit]
         summary = {'queued':len(queue),'saved':0,'failed':0,'cancelled':False}
+        progress(f'Media download started: {len(queue)} pending files; filter={kind}, limit={limit}')
+        if not queue:
+            progress('No files in this queue. Use Audit current chat to inspect attachment types and statuses.')
         for index,att in enumerate(queue,1):
             if cancelled():
                 summary['cancelled'] = True
@@ -287,7 +290,12 @@ class ArchiveService:
             except Exception as error:
                 self.db.mark_failed(chat_id,att['message_id'],att['position'],str(error))
                 summary['failed'] += 1
-            progress(f'Media {index}/{len(queue)}: saved={summary["saved"]}, failed={summary["failed"]}')
+                # Show the first failures immediately without dumping private
+                # message bodies, attachment URLs or session credentials.
+                if summary['failed'] <= 5 or summary['failed'] % 50 == 0:
+                    reason = str(error).replace('\\n', ' ').replace('\\r', ' ')[:180]
+                    progress(f'Download failure #{summary["failed"]} ({att["kind"]}): {reason}')
+            progress(f'Media {index}/{len(queue)} [{att["kind"]}]: saved={summary["saved"]}, failed={summary["failed"]}')
         return summary
 
     def inventory_existing(self, path: Path, progress: Progress = noop):
