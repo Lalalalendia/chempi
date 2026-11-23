@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from chempi.service import ArchiveService,digest_file,sniff_extension
+from chempi.max_client import MaxClientError
 
 
 def message(mid,at='2026-03-07T13:01:00Z',kind='video_circle'):
@@ -17,8 +18,9 @@ class FakeMax:
         self.download_calls=0
     def chats(self):
         return [{'id':'chat-1','title':'Family','kind':'group'}]
-    def sync_page(self,chat_id):
+    def sync_page(self,chat_id,batch_size=60,progress=None):
         self.step+=1
+        if progress: progress(f'MAX: {self.step} messages fetched in current batch')
     def coverage(self,chat_id):
         return {'complete':self.step>=2, 'messages':self.step}
     def store_export(self,chat_id,path):
@@ -57,6 +59,35 @@ class ServiceTests(unittest.TestCase):
         saved=Path(self.tmp.name)/path
         self.assertTrue(saved.exists())
         self.assertEqual(int(saved.stat().st_mtime),1772888460)
+    def test_stop_between_short_history_batches(self):
+        self.srv.refresh_chats()
+        requested = [False]
+        def notify(message):
+            if message.startswith('Batch 1/10 saved:'):
+                requested[0] = True
+        result = self.srv.sync_chat('chat-1', max_pages=10,
+                                    progress=notify, cancelled=lambda: requested[0])
+        self.assertEqual(self.client.step, 1)
+        self.assertEqual(result['state'], 'partial')
+        self.assertEqual(result['total'], 1)
+
+    def test_salvage_cached_pages_after_interrupt(self):
+        class Interrupted(FakeMax):
+            def sync_page(self,chat_id,batch_size=60,progress=None):
+                self.step += 1
+                if progress: progress('MAX: 1 messages fetched in current batch')
+                raise MaxClientError('MAX CLI was interrupted (0xC000013A)')
+        client = Interrupted()
+        self.srv.close()
+        self.srv = ArchiveService(Path(self.tmp.name), client)
+        self.srv.refresh_chats()
+        history = []
+        with self.assertRaises(MaxClientError):
+            self.srv.sync_chat('chat-1', max_pages=4, progress=history.append)
+        self.assertEqual(self.srv.db.audit('chat-1')['total'], 1)
+        self.assertEqual(self.srv.db.audit('chat-1')['coverage']['state'], 'partial')
+        self.assertTrue(any('Recovered CLI cache:' in m for m in history))
+
     def test_cancel_after_first(self):
         self.srv.db.add_messages([message(1),message(2)])
         count=[0]
