@@ -33,6 +33,19 @@ class SyncStreamingTests(unittest.TestCase):
         self.assertIn("interrupted", str(error))
         self.assertIn("0xC000013A", str(error))
 
+    def test_provider_error_reports_safe_hint_not_private_url(self):
+        private = 'https://cdn.example.com/private?access_token=secret123'
+        output = '{"error":{"code":"permission_error","message":"this process is read-only (MAX_READ_ONLY): --output-dir forbidden"}}'
+        error = MaxClient._failed_command(2, 'messages download', output, private)
+        self.assertIn('Read-only lock blocked', str(error))
+        self.assertNotIn('secret123', str(error))
+        self.assertNotIn('https://', str(error))
+
+    def test_invalid_online_attachment_hint(self):
+        error = MaxClient._failed_command(
+            1, 'messages download', '', ' --attachment picks a file this computer already holds; add --offline')
+        self.assertIn('Online --attachment is unsupported', str(error))
+
     def test_sync_rejects_large_batch(self):
         client = MaxClient(executable=sys.executable)
         with self.assertRaises(ValueError):
