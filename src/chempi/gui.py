@@ -49,6 +49,8 @@ class MainWindow(QMainWindow):
         parent=QWidget()
         outer=QVBoxLayout(parent)
         outer.addWidget(QLabel('Archive: '+str(self.root)))
+        self.status = QLabel('Idle - no operation running')
+        outer.addWidget(self.status)
         line=QHBoxLayout()
         self.login=QPushButton('MAX login (QR)')
         self.refresh=QPushButton('Refresh chat list')
@@ -79,8 +81,8 @@ class MainWindow(QMainWindow):
         self.since=QLineEdit()
         self.since.setPlaceholderText('2026-01-01T00:00:00+00:00')
         dates.addWidget(self.since)
-        dates.addWidget(QLabel('History passes:'))
-        self.passes=QSpinBox();self.passes.setRange(1,100);self.passes.setValue(4)
+        dates.addWidget(QLabel('History batches (up to 60 messages each):'))
+        self.passes=QSpinBox();self.passes.setRange(1,1000);self.passes.setValue(20)
         dates.addWidget(self.passes)
         outer.addLayout(dates)
         actions=QHBoxLayout()
@@ -108,10 +110,15 @@ class MainWindow(QMainWindow):
         self.audit.clicked.connect(self.audit_chat)
         self.inventory.clicked.connect(self.index_files)
         self.open.clicked.connect(self.open_folder)
+        self._busy_buttons = [self.login,self.refresh,self.sync,self.download,
+                              self.export,self.audit,self.inventory]
         self.update_list()
 
     def message(self, txt):
-        self.log.appendPlainText(str(txt))
+        text = str(txt)
+        if text.startswith(('MAX:', 'History batch ', 'Batch ')):
+            self.status.setText(text)
+        self.log.appendPlainText(text)
 
     def selected_chat(self):
         item=self.chat_list.currentItem()
@@ -125,6 +132,11 @@ class MainWindow(QMainWindow):
             self.message('Another operation is already running')
             return
         self.worker=Worker(callback)
+        for button in self._busy_buttons:
+            button.setEnabled(False)
+        self.chat_list.setEnabled(False)
+        self.status.setText('Running - waiting for first MAX response...')
+        self.message('Operation started. You can stop after the current short batch.')
         self.worker.progress.connect(self.message)
         self.worker.success.connect(self.finished_job)
         self.worker.failure.connect(lambda text: self.finished_job({'error':text}))
@@ -134,12 +146,18 @@ class MainWindow(QMainWindow):
     def finished_job(self,result):
         self.message(json.dumps(result,ensure_ascii=False,default=str,indent=2))
         self.stop.setEnabled(False)
+        for button in self._busy_buttons:
+            button.setEnabled(True)
+        self.chat_list.setEnabled(True)
+        self.status.setText('Operation finished' if not (isinstance(result,dict) and result.get('error')) else 'Operation failed; existing data preserved')
         self.update_list()
 
     def cancel_job(self):
-        if self.worker:
+        if self.worker and self.worker.isRunning() and not self.worker.cancel.is_set():
             self.worker.cancel.set()
-            self.message('Cancellation requested (after current request/file).')
+            self.stop.setEnabled(False)
+            self.status.setText('Stopping after current batch...')
+            self.message('Stop requested. Waiting for current batch; previous data stay saved.')
 
     def start_login(self):
         try:
