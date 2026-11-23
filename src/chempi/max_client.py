@@ -228,12 +228,20 @@ class MaxClient:
     def all_coverage(self):
         return self.run('store','chats','status',timeout=90)
 
-    def media_download(self, chat_id: str, message_id: str, position: int, folder: Path):
+    def media_download(self, chat_id: str, message_id: str, position: int, folder: Path,
+                       offline: bool = False):
+        """Online downloads *all* media of a message; --attachment is offline-only.
+
+        The online command also records each file's position in WireCat's
+        local store. Afterwards, an offline call copies a single numbered
+        attachment to its own staging folder, without a second network fetch.
+        """
         folder.mkdir(parents=True, exist_ok=True)
-        # This command downloads only one attachment (1-based file position).
-        return self.run('messages','download',chat_id,message_id,
-                        '--attachment',str(position),'--output-dir',str(folder),
-                        timeout=3600,work_folder=folder)
+        arguments = ['messages', 'download', chat_id, message_id]
+        if offline:
+            arguments.extend(('--attachment', str(position), '--offline'))
+        arguments.extend(('--output-dir', str(folder)))
+        return self.run(*arguments, timeout=3600, work_folder=folder)
 
 
 def launch_setup_terminal(profile='personal'):
