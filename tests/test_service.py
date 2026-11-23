@@ -84,6 +84,24 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(second['queued'],0)
         self.assertEqual(self.client.download_calls,1)
 
+    def test_systemic_media_failure_stops_after_three(self):
+        class BrokenMax(FakeMax):
+            def media_download(self,chat_id,mid,pos,folder,offline=False):
+                self.download_calls += 1
+                raise MaxClientError('permission_error: read-only export folder not allowed')
+        self.srv.close()
+        broken=BrokenMax()
+        self.srv=ArchiveService(Path(self.tmp.name),broken)
+        self.srv.db.add_messages([message(i,kind='photo') for i in range(1,21)])
+        lines=[]
+        outcome=self.srv.download_media('chat-1','photo',limit=20,progress=lines.append)
+        self.assertEqual(outcome['queued'],20)
+        self.assertTrue(outcome['aborted'])
+        self.assertEqual(outcome['saved'],0)
+        self.assertEqual(outcome['failed'],3)
+        self.assertEqual(len(self.srv.db.media_queue('chat-1','photo')),20)
+        self.assertTrue(any('Auto-stopped after 3 identical errors' in x for x in lines))
+
     def test_cli_sync_complete_flag_is_authoritative(self):
         class FullSync(FakeMax):
             def coverage(self,chat_id):
