@@ -84,7 +84,8 @@ class MaxClient:
         return subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
     @staticmethod
-    def _failed_command(returncode, operation):
+    def _failed_command(returncode, operation, stdout='', stderr=''):
+        """Summarize a CLI failure without emitting media URLs, tokens or chat text."""
         code = returncode & 0xffffffff
         if code == 0xC000013A:
             return MaxClientError(
@@ -96,8 +97,27 @@ class MaxClient:
             return MaxClientError('MAX rate limit reached. Retry after cooldown.')
         if returncode == 4:
             return MaxClientError('MAX authorization required. Sign in again.')
-        return MaxClientError(f'MAX CLI {operation} failed (exit {returncode}). '
-                              'Existing archive data were not deleted.')
+        # Only recognized provider error patterns are surfaced. Raw stdout and
+        # stderr can contain account identifiers and private message metadata.
+        raw = (str(stdout)[-8000:] + '\n' + str(stderr)[-8000:]).lower()
+        if '--attachment picks a file' in raw or 'add --offline' in raw:
+            hint = 'Online --attachment is unsupported; use --offline for a selected file.'
+        elif ('read-only' in raw or 'read_only' in raw) and (
+                '--output' in raw or 'work folder' in raw):
+            hint = 'Read-only lock blocked writing to the local output folder.'
+        elif 'authentication required' in raw or 'not logged in' in raw:
+            hint = 'MAX session is not authenticated.'
+        elif 'rate limit' in raw or 'too many requests' in raw:
+            hint = 'MAX is rate-limiting requests.'
+        elif 'no file to download' in raw:
+            hint = 'MAX returned no downloadable file for this message.'
+        else:
+            match = re.search(r'"(?:code|reason)"\s*:\s*"([a-z][a-z0-9_.-]{1,48})"', raw)
+            hint = ('Error category: ' + match.group(1)) if match else (
+                'Provider error details were withheld to protect chat data; '
+                'inspect the local CLI command exit code.'
+            )
+        return MaxClientError(f'MAX CLI {operation} failed (exit {returncode}). {hint}')
 
     def run(self, *arguments, timeout=3600, json_output=True, work_folder=None):
         """Small read-only CLI calls. History sync has its own live-progress path."""
@@ -112,7 +132,8 @@ class MaxClient:
         except subprocess.TimeoutExpired as error:
             raise MaxClientError(f'MAX CLI timeout during {arguments[:2]}') from error
         if response.returncode:
-            raise self._failed_command(response.returncode, ' '.join(map(str, arguments[:2])))
+            raise self._failed_command(response.returncode, ' '.join(map(str, arguments[:2])),
+                                       response.stdout, response.stderr)
         return extract_payload(response.stdout) if json_output else response.stdout
 
     def _streaming_sync(self, command, progress, timeout=1800):
@@ -185,7 +206,8 @@ class MaxClient:
             process.stderr.close()
 
         if code != 0:
-            raise self._failed_command(code, 'messages sync')
+            raise self._failed_command(code, 'messages sync',
+                                       ''.join(stdout_parts), '\n'.join(stderr_tail))
         if stdout_oversize[0]:
             raise MaxClientError('MAX CLI returned unexpectedly large sync result')
         return extract_payload(''.join(stdout_parts))
