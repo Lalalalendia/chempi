@@ -247,55 +247,101 @@ class ArchiveService:
         progress(f'Media download started: {len(queue)} pending files; filter={kind}, limit={limit}')
         if not queue:
             progress('No files in this queue. Use Audit current chat to inspect attachment types and statuses.')
-        for index,att in enumerate(queue,1):
+        # The upstream MAX CLI does not accept --attachment online. One online
+        # call downloads *every* file in that message; one offline command per
+        # requested position then copies exactly that file. Grouping by message
+        # makes albums a single remote operation, not N repeated downloads.
+        groups = {}
+        for att in queue:
+            groups.setdefault(att['message_id'], []).append(att)
+        index = 0
+        for message_id, items in groups.items():
             if cancelled():
                 summary['cancelled'] = True
                 break
-            if att['kind'] in {'link','unknown'}:
-                self.db.mark_failed(chat_id,att['message_id'],att['position'],
-                                    'No verified downloadable media type; examine source JSON')
-                summary['failed'] += 1
-                continue
-            rel_folder = Path('media') / safe_label(chat_id,32) / att['kind']
-            target_dir = self.db.root / rel_folder
-            target_dir.mkdir(parents=True,exist_ok=True)
-            try:
-                with tempfile.TemporaryDirectory(prefix='chempi-file-',dir=self.db.root) as directory:
-                    tmpdir = Path(directory)
-                    result = self.client.media_download(chat_id,att['message_id'],att['position'],tmpdir)
-                    source = self._extract_download_file(tmpdir,result)
-                    size,digest = digest_file(source)
-                    if size == 0:
-                        raise MaxClientError('Empty download')
-                    suffix = sniff_extension(source,att['original_name'],att['mime_type'])
-                    name = stable_file_stem(chat_id,att['message_id'],att['position'])+suffix
-                    target = target_dir / name
-                    if target.exists():
-                        existing_size,existing_hash=digest_file(target)
-                        if (existing_size,existing_hash) != (size,digest):
-                            name=stable_file_stem(chat_id,att['message_id'],att['position'])+'-'+digest[:10]+suffix
-                            target=target_dir/name
-                    if not target.exists():
-                        # replace on the same disk: tempdir is placed under archive root.
-                        os.replace(source,target)
-                    if att['sent_at']:
+            with tempfile.TemporaryDirectory(prefix='chempi-message-',dir=self.db.root) as directory:
+                tmpdir = Path(directory)
+                online_attempted = False
+                online_error = None
+                for att in items:
+                    if cancelled():
+                        summary['cancelled'] = True
+                        break
+                    index += 1
+                    if att['kind'] == 'link':
+                        self.db.mark_failed(chat_id, message_id, att['position'], 'Link is not a downloadable attachment')
+                        summary['failed'] += 1
+                        progress(f'Media {index}/{len(queue)} [link]: not downloadable')
+                        continue
+                    rel_folder = Path('media') / safe_label(chat_id,32) / att['kind']
+                    target_dir = self.db.root / rel_folder
+                    target_dir.mkdir(parents=True,exist_ok=True)
+                    try:
+                        selected = tmpdir / f"selected-{att['position']}"
+                        selected.mkdir(exist_ok=True)
                         try:
-                            stamp = datetime.fromisoformat(att['sent_at']).timestamp()
-                            os.utime(target,(stamp,stamp))
-                        except (OSError,OverflowError,ValueError):
-                            pass
-                    relative = str(target.relative_to(self.db.root)).replace('\\','/')
-                    self.db.mark_downloaded(chat_id,att['message_id'],att['position'],relative,size,digest)
-                    summary['saved'] += 1
-            except Exception as error:
-                self.db.mark_failed(chat_id,att['message_id'],att['position'],str(error))
-                summary['failed'] += 1
-                # Show the first failures immediately without dumping private
-                # message bodies, attachment URLs or session credentials.
-                if summary['failed'] <= 5 or summary['failed'] % 50 == 0:
-                    reason = str(error).replace('\\n', ' ').replace('\\r', ' ')[:180]
-                    progress(f'Download failure #{summary["failed"]} ({att["kind"]}): {reason}')
-            progress(f'Media {index}/{len(queue)} [{att["kind"]}]: saved={summary["saved"]}, failed={summary["failed"]}')
+                            # Fast path: the file is already in WireCat's local
+                            # cache. No remote network download is required.
+                            result = self.client.media_download(
+                                chat_id, message_id, att['position'], selected, offline=True)
+                        except MaxClientError:
+                            # An online request fetches the entire message,
+                            # which can contain multiple photos/videos.
+                            if not online_attempted:
+                                online_attempted = True
+                                progress(f'Message media fetch: {len(items)} requested files in this message')
+                                online_folder = tmpdir / 'online'
+                                try:
+                                    self.client.media_download(
+                                        chat_id, message_id, att['position'], online_folder, offline=False)
+                                except MaxClientError as error:
+                                    # Some earlier attachments may have saved,
+                                    # even when a later item failed. Salvage
+                                    # through exact-position offline copies.
+                                    online_error = error
+                            shutil.rmtree(selected)
+                            selected.mkdir()
+                            try:
+                                result = self.client.media_download(
+                                    chat_id, message_id, att['position'], selected, offline=True)
+                            except MaxClientError as error:
+                                if online_error is not None:
+                                    raise MaxClientError(
+                                        f'Online media fetch failed: {online_error}; '
+                                        f'local selection also unavailable: {error}') from error
+                                raise
+                        source = self._extract_download_file(selected, result)
+                        size,digest = digest_file(source)
+                        if size == 0:
+                            raise MaxClientError('Empty download')
+                        suffix = sniff_extension(source,att['original_name'],att['mime_type'])
+                        name = stable_file_stem(chat_id,message_id,att['position'])+suffix
+                        target = target_dir / name
+                        if target.exists():
+                            existing_size,existing_hash=digest_file(target)
+                            if (existing_size,existing_hash) != (size,digest):
+                                name=stable_file_stem(chat_id,message_id,att['position'])+'-'+digest[:10]+suffix
+                                target=target_dir/name
+                        if not target.exists():
+                            os.replace(source,target)
+                        if att['sent_at']:
+                            try:
+                                stamp = datetime.fromisoformat(att['sent_at']).timestamp()
+                                os.utime(target,(stamp,stamp))
+                            except (OSError,OverflowError,ValueError):
+                                pass
+                        relative = str(target.relative_to(self.db.root)).replace('\\','/')
+                        self.db.mark_downloaded(chat_id,message_id,att['position'],relative,size,digest)
+                        summary['saved'] += 1
+                    except Exception as error:
+                        self.db.mark_failed(chat_id,message_id,att['position'],str(error))
+                        summary['failed'] += 1
+                        if summary['failed'] <= 5 or summary['failed'] % 50 == 0:
+                            reason = str(error).replace('\\n', ' ').replace('\\r', ' ')[:180]
+                            progress(f'Download failure #{summary["failed"]} ({att["kind"]}): {reason}')
+                    progress(f'Media {index}/{len(queue)} [{att["kind"]}]: saved={summary["saved"]}, failed={summary["failed"]}')
+            if summary['cancelled']:
+                break
         return summary
 
     def inventory_existing(self, path: Path, progress: Progress = noop):
