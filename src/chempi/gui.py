@@ -19,6 +19,7 @@ from .cli import default_root
 from .max_client import MaxClient, launch_setup_terminal
 from .service import ArchiveService
 from .exporter import export_html, export_jsonl
+from .build_info import BUILD_NUMBER
 
 
 class Worker(QThread):
@@ -44,11 +45,11 @@ class MainWindow(QMainWindow):
         self.root=Path(root)
         self.profile=profile
         self.worker=None
-        self.setWindowTitle('Chempi - MAX Archive 0.1')
+        self.setWindowTitle(f'Chempi - MAX Archive - build {BUILD_NUMBER}')
         self.resize(950,720)
         parent=QWidget()
         outer=QVBoxLayout(parent)
-        outer.addWidget(QLabel('Archive: '+str(self.root)))
+        outer.addWidget(QLabel(f'Chempi build: {BUILD_NUMBER} | Archive: {self.root}'))
         self.status = QLabel('Idle - no operation running')
         outer.addWidget(self.status)
         line=QHBoxLayout()
