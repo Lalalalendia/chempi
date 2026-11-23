@@ -61,6 +61,10 @@ def sniff_extension(path: Path, fallback_name: str | None = None, mime_type: str
 def _explicit_complete(status: dict) -> bool:
     if not isinstance(status, dict):
         return False
+    # Reaching the first message is not considered complete if the run
+    # itself was cancelled or interrupted.
+    if status.get('stopped') is True or status.get('error'):
+        return False
     for key in ('complete','fully_fetched','history_complete','fetched_all','back_to_start'):
         if status.get(key) is True:
             return True
