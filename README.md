@@ -21,7 +21,29 @@ MAX (QR login in max-cli)
   -> offline exports/*.html and *.jsonl
 ```
 
-## Windows quick start
+## Portable Windows EXE (no Python/Node installation)
+
+The [Windows portable build](.github/workflows/build-portable.yml) publishes an
+experimental `Chempi-MAX-Windows-portable.zip` as a GitHub prerelease and
+as a downloadable GitHub Actions artifact after successful smoke tests.
+
+1. Extract the **whole** `Chempi` folder and run `Chempi.exe`. Keep `_internal/`
+   and `runtime/` together with it. The EXE alone is not enough.
+2. Click `MAX login (QR)`, scan the QR in the new console. This is a fresh
+   local session managed by the bundled MAX CLI, not Chrome cookie extraction.
+3. Refresh chats, sync messages, and choose `Video circles only` to download
+   only unarchived files whose metadata identifies them as circles.
+4. Your SQLite database, media and exports stay in `Chempi/data/` beside
+   the EXE; **preserve this folder when updating**. You can set the
+   `CHEMPI_ARCHIVE_DIR` environment variable to use a different directory.
+
+This is a portable application **folder**, not a one-file self-extractor.
+It includes Node.js, a pinned `@wirecat/max-cli`, Python and Qt libraries;
+installing Python or Node yourself is unnecessary. The MAX CLI may store its
+own login credentials separately in your Windows user profile. **Real MAX
+login and videonote downloads have not been validated in CI.**
+
+## Windows quick start (development from source)
 
 1. Install Python 3.11+ and Node.js 22.16+ or 24+.
 2. Install MAX CLI yourself from its trusted source: `npm install -g @wirecat/max-cli`.
@@ -35,7 +57,7 @@ MAX (QR login in max-cli)
    missing files**. Existing Chempi downloads are skipped by default.
 7. Click **Export HTML + JSONL** at any point, even with partially synced history.
 
-The media and database folders default to `%USERPROFILE%\\Documents\\Chempi-MAX`.
+The source build defaults to `%USERPROFILE%\\Documents\\Chempi-MAX`; the portable EXE stores them beside the program under `Chempi/data/`.
 Never commit your archive, browser profile, token, or downloaded files to Git.
 
 ### Command line (without PyQt6)
