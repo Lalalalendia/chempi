@@ -44,7 +44,19 @@ class WorkFolderTests(unittest.TestCase):
             command, env = seen[0]
             self.assertEqual(env["MAX_READ_ONLY"], "1")
             self.assertEqual(Path(env["MAX_WORK_FOLDER"]), (root / "staging").resolve())
-            self.assertEqual(command[command.index("--attachment") + 1], "2")
+            self.assertNotIn("--attachment",command)
+            self.assertNotIn("--offline",command)
+
+    def test_precise_attachment_copy_must_be_offline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls=[]
+            def runner(command, **options):
+                calls.append(command)
+                return SimpleNamespace(returncode=0, stdout='{"item":{"files":[]}}', stderr="")
+            cli = MaxClient(executable="max",runner=runner)
+            cli.media_download("chat", "message", 2, Path(folder), offline=True)
+            self.assertIn("--offline",calls[0])
+            self.assertEqual(calls[0][calls[0].index("--attachment")+1],"2")
 
     def test_plain_commands_cannot_inherit_unrestricted_folder(self):
         seen = []
