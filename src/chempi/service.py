@@ -64,7 +64,9 @@ def _explicit_complete(status: dict) -> bool:
     for key in ('complete','fully_fetched','history_complete','fetched_all','back_to_start'):
         if status.get(key) is True:
             return True
-    for key in ('coverage','held'):
+    # CLI JSON wraps command results as {"item": {...}, "meta": {...}}.
+    # "messages sync" reports an explicit complete flag in item.
+    for key in ('item','data','result','coverage','held'):
         part = status.get(key)
         if isinstance(part, dict) and _explicit_complete(part):
             return True
@@ -117,6 +119,8 @@ class ArchiveService:
         imported = 0
         state = 'partial'
         error = None
+        sync_complete = False
+        last_sync_status = None
         try:
             # First preserve whatever was synced by an earlier attempt.
             try:
@@ -139,23 +143,39 @@ class ArchiveService:
                 progress(f'History batch {i+1}/{max_pages} started (up to 60 messages)')
                 # MAX CLI reports fetched counts while running; don't wait for
                 # the whole command before showing the user progress.
-                self.client.sync_page(chat_id, batch_size=60, progress=progress)
+                reply = self.client.sync_page(chat_id, batch_size=60, progress=progress)
+                response = reply.get('item', reply) if isinstance(reply, dict) else {}
+                if isinstance(response, dict):
+                    last_sync_status = {
+                        k: response.get(k) for k in (
+                            'fetched', 'complete', 'stopped', 'reached_since',
+                            'reached_last', 'limited', 'resume', 'ranges'
+                        ) if k in response
+                    }
+                sync_complete = _explicit_complete(reply)
                 count, _ = self._export_and_import(chat_id)
                 after = self.db.audit(chat_id)['total']
                 imported += max(0, after - before)
                 progress(f'Batch {i+1}/{max_pages} saved: {after} unique messages total (+{after-before})')
+                if sync_complete:
+                    state = 'full'
+                    progress('MAX CLI confirmed complete history from the first message (no interior gaps)')
+                    break
                 status = self.client.coverage(chat_id)
                 if _explicit_complete(status):
                     state = 'full'
                     break
                 unchanged = unchanged+1 if after == before else 0
                 if unchanged >= 2:
-                    progress('No further messages received; completeness unconfirmed')
+                    progress('Two batches returned no NEW records in SQLite. Checking the MAX CLI completion flag; not claiming full history.')
                     break
             raw = self.client.coverage(chat_id)
-            if _explicit_complete(raw):
+            if _explicit_complete(raw) or sync_complete:
                 state = 'full'
-            self.db.set_coverage(chat_id,state,raw if isinstance(raw,dict) else {'raw':raw})
+            report = raw if isinstance(raw, dict) else {'raw': raw}
+            if last_sync_status is not None:
+                report = {**report, 'last_sync': last_sync_status}
+            self.db.set_coverage(chat_id, state, report)
         except Exception as exc:
             error = str(exc)[:700]
             progress(f'Sync interrupted: {error}')
