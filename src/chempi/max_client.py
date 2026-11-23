@@ -62,12 +62,21 @@ class MaxClient:
         self.runner = runner or subprocess.run
 
     @staticmethod
-    def _runtime_environment():
+    def _runtime_environment(work_folder=None):
         env = os.environ.copy()
         # MAX CLI read/download functions must not send, edit or delete messages.
         # Setup/login runs separately and is intentionally not subject to this.
         env['MAX_READ_ONLY'] = '1'
         env['MAX_NO_UPDATE_CHECK'] = '1'
+        # Under the WireCat read-only lock, --output/--output-dir is
+        # explicitly refused unless MAX_WORK_FOLDER encloses the output.
+        # Each caller authorizes only its own temporary subfolder.
+        env.pop('MAX_WORK_FOLDER', None)
+        if work_folder is not None:
+            directory = Path(work_folder).resolve(strict=True)
+            if not directory.is_dir():
+                raise MaxClientError('MAX download work folder must be a directory')
+            env['MAX_WORK_FOLDER'] = str(directory)
         return env
 
     @staticmethod
@@ -90,7 +99,7 @@ class MaxClient:
         return MaxClientError(f'MAX CLI {operation} failed (exit {returncode}). '
                               'Existing archive data were not deleted.')
 
-    def run(self, *arguments, timeout=3600, json_output=True):
+    def run(self, *arguments, timeout=3600, json_output=True, work_folder=None):
         """Small read-only CLI calls. History sync has its own live-progress path."""
         command = [*self.command_prefix, self.profile, *map(str, arguments)]
         if json_output:
@@ -98,7 +107,7 @@ class MaxClient:
         try:
             response = self.runner(command, capture_output=True, text=True,
                                    encoding='utf-8', errors='replace', timeout=timeout,
-                                   check=False, env=self._runtime_environment(),
+                                   check=False, env=self._runtime_environment(work_folder),
                                    creationflags=self._windows_flags())
         except subprocess.TimeoutExpired as error:
             raise MaxClientError(f'MAX CLI timeout during {arguments[:2]}') from error
@@ -195,7 +204,8 @@ class MaxClient:
         # target path must not exist: max refuses to overwrite it.
         if path.exists():
             raise FileExistsError(path)
-        self.run('store','export',chat_id,'--format','jsonl','--output',str(path),timeout=1800)
+        self.run('store','export',chat_id,'--format','jsonl','--output',str(path),
+                 timeout=1800,work_folder=path.parent)
         if not path.is_file():
             raise MaxClientError('MAX did not create export file')
         return path
@@ -222,7 +232,8 @@ class MaxClient:
         folder.mkdir(parents=True, exist_ok=True)
         # This command downloads only one attachment (1-based file position).
         return self.run('messages','download',chat_id,message_id,
-                        '--attachment',str(position),'--output-dir',str(folder),timeout=3600)
+                        '--attachment',str(position),'--output-dir',str(folder),
+                        timeout=3600,work_folder=folder)
 
 
 def launch_setup_terminal(profile='personal'):
