@@ -256,9 +256,6 @@ class ArchiveService:
             groups.setdefault(att['message_id'], []).append(att)
         index = 0
         for message_id, items in groups.items():
-            if cancelled():
-                summary['cancelled'] = True
-                break
             with tempfile.TemporaryDirectory(prefix='chempi-message-',dir=self.db.root) as directory:
                 tmpdir = Path(directory)
                 online_attempted = False
