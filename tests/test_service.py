@@ -59,6 +59,31 @@ class ServiceTests(unittest.TestCase):
         saved=Path(self.tmp.name)/path
         self.assertTrue(saved.exists())
         self.assertEqual(int(saved.stat().st_mtime),1772888460)
+    def test_cli_sync_complete_flag_is_authoritative(self):
+        class FullSync(FakeMax):
+            def coverage(self,chat_id):
+                # Store status doesn't carry the sync operation's complete flag.
+                return {'item': {'messages':self.step,'oldest_at':'2023-01-01'}}
+            def sync_page(self,chat_id,batch_size=60,progress=None):
+                self.step += 1
+                return {'item':{'chat':chat_id,'fetched':1,'complete':True,'ranges':[{'from':1,'to':1}]}}
+        self.srv.close()
+        client=FullSync()
+        self.srv=ArchiveService(Path(self.tmp.name),client)
+        self.srv.refresh_chats()
+        out=self.srv.sync_chat('chat-1',max_pages=10)
+        self.assertEqual(out['total'],1)
+        self.assertEqual(out['state'],'full')
+        self.assertEqual(client.step,1)
+        report=self.srv.db.audit('chat-1')['coverage']
+        self.assertEqual(report['state'],'full')
+
+    def test_nested_cli_json_complete_is_seen(self):
+        from chempi.service import _explicit_complete
+        self.assertTrue(_explicit_complete({'item':{'complete':True, 'fetched':0}}))
+        self.assertFalse(_explicit_complete({'item':{'complete':False, 'fetched':0}}))
+        self.assertFalse(_explicit_complete({'item':{'complete':True,'stopped':True}}))
+
     def test_stop_between_short_history_batches(self):
         self.srv.refresh_chats()
         requested = [False]
