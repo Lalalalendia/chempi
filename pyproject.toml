@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chempi-max-archive"
+version = "0.1.0"
+description = "Local MAX chat archival with SQLite and deduplicated media"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.7,<7"]
+
+[project.scripts]
+chempi = "chempi.cli:main"
+chempi-gui = "chempi.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
