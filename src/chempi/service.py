@@ -38,6 +38,12 @@ def sniff_extension(path: Path, fallback_name: str | None = None, mime_type: str
         return '.png'
     if head[:6] in (b'GIF87a', b'GIF89a'):
         return '.gif'
+    # WebP is a RIFF container, not a video despite some decoders
+    # reporting its first image as a video stream.
+    if (len(head) >= 16 and head[:4] == b'RIFF'
+            and head[8:12] == b'WEBP'
+            and head[12:16] in (b'VP8 ', b'VP8L', b'VP8X')):
+        return '.webp'
     if len(head) >= 12 and head[4:8] == b'ftyp':
         return '.mp4'
     if head.startswith(b'\x1a\x45\xdf\xa3'):
@@ -204,11 +210,17 @@ class ArchiveService:
             raise MaxClientError(error)
         return {'chat_id':chat_id,'imported':imported,'state':state,'total':self.db.audit(chat_id)['total']}
 
-    def verify_recorded_media(self, chat_id: str):
-        """Only mark missing or corrupt files for re-download."""
-        fixed = 0
-        rows = list(self.db.connection.execute('''SELECT chat_id,message_id,position,local_path,file_size,sha256
-            FROM attachments WHERE chat_id=? AND status='downloaded' ''',(chat_id,)))
+    def verify_recorded_media(self, chat_id: str, progress: Progress = noop):
+        """Verify retained bytes and repair clear .bin extensions without downloading.
+
+        Never declare a WebP preview to be a successfully downloaded video.
+        Already saved files are preserved even when the attachment is requeued.
+        """
+        requeued = 0
+        repaired = 0
+        rows = list(self.db.connection.execute('''SELECT chat_id,message_id,position,kind,
+            local_path,file_size,sha256 FROM attachments
+            WHERE chat_id=? AND status='downloaded' ''',(chat_id,)))
         for row in rows:
             path = Path(row['local_path']) if row['local_path'] else None
             if path and not path.is_absolute():
@@ -219,11 +231,42 @@ class ArchiveService:
                 valid = size == row['file_size'] and digest == row['sha256']
             if not valid:
                 with self.db.transaction():
-                    self.db.connection.execute('''UPDATE attachments SET status='pending',last_error='Local file missing or corrupt'
+                    self.db.connection.execute('''UPDATE attachments
+                        SET status='pending',last_error='Local file missing or corrupt'
                         WHERE chat_id=? AND message_id=? AND position=?''',
                         (row['chat_id'],row['message_id'],row['position']))
-                fixed += 1
-        return fixed
+                requeued += 1
+                continue
+            # Determine type from file content, never MIME claims or remote names.
+            actual = sniff_extension(path)
+            if row['kind'] in {'video','video_circle'} and actual in {
+                    '.webp','.jpg','.png','.gif'}:
+                with self.db.transaction():
+                    self.db.connection.execute('''UPDATE attachments
+                        SET status='pending',
+                            last_error='Saved video bytes are an image/preview, not a video; original retained'
+                        WHERE chat_id=? AND message_id=? AND position=?''',
+                        (row['chat_id'],row['message_id'],row['position']))
+                requeued += 1
+                continue
+            # If an earlier Chempi build stored an actual WebP as *.bin, fix
+            # its extension and SQLite path without touching its bytes or mtime.
+            if path.suffix.lower() == '.bin' and actual == '.webp':
+                correct = path.with_suffix('.webp')
+                if not correct.exists():
+                    try:
+                        path.rename(correct)
+                        relative = str(correct.relative_to(self.db.root)).replace('\\','/')
+                        with self.db.transaction():
+                            self.db.connection.execute('''UPDATE attachments SET local_path=?
+                                WHERE chat_id=? AND message_id=? AND position=?''',
+                                (relative,row['chat_id'],row['message_id'],row['position']))
+                        repaired += 1
+                    except (OSError,ValueError) as error:
+                        progress(f'Cannot rename an existing WebP file: {type(error).__name__}')
+        if repaired:
+            progress(f'Repaired {repaired} saved WebP filename(s) without redownloading')
+        return requeued
 
     def _extract_download_file(self, directory: Path, result):
         files = [path for path in directory.rglob('*') if path.is_file() and path.stat().st_size > 0]
@@ -240,8 +283,8 @@ class ArchiveService:
         if limit < 1 or limit > 100000:
             raise ValueError('Invalid download limit')
         if verify:
-            count = self.verify_recorded_media(chat_id)
-            progress(f'Requeued missing or corrupt files: {count}')
+            count = self.verify_recorded_media(chat_id, progress=progress)
+            progress(f'Requeued missing, corrupt or mislabeled video files: {count}')
         queue = self.db.media_queue(chat_id,kind,since)[:limit]
         summary = {'queued':len(queue),'saved':0,'failed':0,'cancelled':False,'aborted':False}
         consecutive_error = None
@@ -314,6 +357,14 @@ class ArchiveService:
                         if size == 0:
                             raise MaxClientError('Empty download')
                         suffix = sniff_extension(source,att['original_name'],att['mime_type'])
+                        # Images returned for a video are usually previews,
+                        # not successful video downloads. Keep retry possible.
+                        detected = sniff_extension(source)
+                        if att['kind'] in {'video','video_circle'} and detected in {
+                                '.webp','.jpg','.png','.gif'}:
+                            raise MaxClientError(
+                                'MAX returned an image/thumbnail for a video, '
+                                f'not the playable video file ({detected})')
                         name = stable_file_stem(chat_id,message_id,att['position'])+suffix
                         target = target_dir / name
                         if target.exists():
