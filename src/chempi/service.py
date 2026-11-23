@@ -99,14 +99,17 @@ class ArchiveService:
             self.client.store_export(chat_id,path)
             return self.import_jsonl(path,chat_id)
 
-    def sync_chat(self, chat_id: str, max_pages=4, progress: Progress = noop, cancelled=lambda: False):
-        """Each pass fetches at most 1200. `max_pages` bounds runs, not server messages.
-        Coverage is never guessed from a scrollbar or last page count.
+    def sync_chat(self, chat_id: str, max_pages=20, progress: Progress = noop, cancelled=lambda: False):
+        """Fetch in short restartable 60-message batches.
+
+        A Stop request takes effect between batches (usually one or two MAX pages).
+        Each completed batch is imported into SQLite; a failed batch is recovered
+        from the CLI's local store before we report the failure.
         """
         if self.client is None:
             raise MaxClientError('MAX client is not configured')
-        if max_pages < 1 or max_pages > 100:
-            raise ValueError('max_pages must be between 1 and 100')
+        if max_pages < 1 or max_pages > 1000:
+            raise ValueError('max_pages must be between 1 and 1000')
         with self.db.transaction():
             cur = self.db.connection.execute('INSERT INTO sync_runs(chat_id,started_at,status) VALUES(?,?,?)',
                                              (chat_id,utcnow(),'running'))
@@ -133,11 +136,14 @@ class ArchiveService:
                     state = 'full'
                     break
                 before = self.db.audit(chat_id)['total']
-                self.client.sync_page(chat_id)
+                progress(f'History batch {i+1}/{max_pages} started (up to 60 messages)')
+                # MAX CLI reports fetched counts while running; don't wait for
+                # the whole command before showing the user progress.
+                self.client.sync_page(chat_id, batch_size=60, progress=progress)
                 count, _ = self._export_and_import(chat_id)
                 after = self.db.audit(chat_id)['total']
                 imported += max(0, after - before)
-                progress(f'Pass {i+1}/{max_pages}: {after} stored, {after-before} new')
+                progress(f'Batch {i+1}/{max_pages} saved: {after} unique messages total (+{after-before})')
                 status = self.client.coverage(chat_id)
                 if _explicit_complete(status):
                     state = 'full'
@@ -151,10 +157,21 @@ class ArchiveService:
                 state = 'full'
             self.db.set_coverage(chat_id,state,raw if isinstance(raw,dict) else {'raw':raw})
         except Exception as exc:
-            error = str(exc)[:1000]
-            progress(f'Sync stopped: {error}')
-            # No manufactured success: report state unknown on error.
-            self.db.set_coverage(chat_id,'partial',{'error': error})
+            error = str(exc)[:700]
+            progress(f'Sync interrupted: {error}')
+            # A failed MAX CLI subprocess may already have fetched many pages.
+            # Salvage its persisted local cache before returning an error.
+            try:
+                before = self.db.audit(chat_id)['total']
+                self._export_and_import(chat_id)
+                after = self.db.audit(chat_id)['total']
+                recovered = max(0, after - before)
+                imported += recovered
+                progress(f'Recovered CLI cache: {after} unique messages in SQLite (+{recovered})')
+            except Exception as recovery:
+                progress(f'Cache recovery unavailable: {type(recovery).__name__}')
+            # Never claim history is complete based solely on a partial fetch.
+            self.db.set_coverage(chat_id, 'partial', {'error': error})
         finally:
             with self.db.transaction():
                 self.db.connection.execute('UPDATE sync_runs SET finished_at=?,imported=?,status=?,error=? WHERE id=?',
