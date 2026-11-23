@@ -243,7 +243,9 @@ class ArchiveService:
             count = self.verify_recorded_media(chat_id)
             progress(f'Requeued missing or corrupt files: {count}')
         queue = self.db.media_queue(chat_id,kind,since)[:limit]
-        summary = {'queued':len(queue),'saved':0,'failed':0,'cancelled':False}
+        summary = {'queued':len(queue),'saved':0,'failed':0,'cancelled':False,'aborted':False}
+        consecutive_error = None
+        repeated_errors = 0
         progress(f'Media download started: {len(queue)} pending files; filter={kind}, limit={limit}')
         if not queue:
             progress('No files in this queue. Use Audit current chat to inspect attachment types and statuses.')
@@ -330,14 +332,31 @@ class ArchiveService:
                         relative = str(target.relative_to(self.db.root)).replace('\\','/')
                         self.db.mark_downloaded(chat_id,message_id,att['position'],relative,size,digest)
                         summary['saved'] += 1
+                        consecutive_error = None
+                        repeated_errors = 0
                     except Exception as error:
                         self.db.mark_failed(chat_id,message_id,att['position'],str(error))
                         summary['failed'] += 1
+                        reason = str(error).replace('\\n', ' ').replace('\\r', ' ')[:180]
                         if summary['failed'] <= 5 or summary['failed'] % 50 == 0:
-                            reason = str(error).replace('\\n', ' ').replace('\\r', ' ')[:180]
                             progress(f'Download failure #{summary["failed"]} ({att["kind"]}): {reason}')
+                        # Never burn hundreds of requests against one systemic
+                        # problem (wrong CLI flag, read-only refusal, no auth).
+                        # The remainder stay pending or failed, and remain retryable.
+                        key = (type(error).__name__, str(error)[:200])
+                        if key == consecutive_error:
+                            repeated_errors += 1
+                        else:
+                            consecutive_error, repeated_errors = key, 1
+                        threshold = 3 if summary['saved'] == 0 else 10
+                        if repeated_errors >= threshold:
+                            summary['aborted'] = True
+                            progress(f'Auto-stopped after {repeated_errors} identical errors. '
+                                     f'{len(queue)-index} unattempted attachments remain queued.')
                     progress(f'Media {index}/{len(queue)} [{att["kind"]}]: saved={summary["saved"]}, failed={summary["failed"]}')
-            if summary['cancelled']:
+                    if summary['aborted']:
+                        break
+            if summary['cancelled'] or summary['aborted']:
                 break
         return summary
 
