@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import os
 
 from .database import ArchiveDB
 from .exporter import export_html, export_jsonl
@@ -12,7 +13,14 @@ from .service import ArchiveService
 
 
 def default_root() -> Path:
-    return Path.home()/'Documents'/'Chempi-MAX'
+    override = os.environ.get('CHEMPI_ARCHIVE_DIR')
+    if override:
+        return Path(override).expanduser()
+    if getattr(sys, 'frozen', False):
+        exe_folder = Path(sys.executable).resolve().parent
+        if (exe_folder / 'portable.flag').is_file():
+            return exe_folder / 'data'
+    return Path.home() / 'Documents' / 'Chempi-MAX'
 
 
 def parser():
